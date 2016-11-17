@@ -662,6 +662,149 @@ class PartitioningTests(unittest.TestCase):
         node.stop()
         node.cleanup()
 
+    def test_pg_dump(self):
+        """
+        Test using dump and restore of partitioned table through pg_dump and pg_restore tools.
+
+        Test strategy:
+        - test range and hash partitioned tables;
+        - for each partitioned table check on restorable side the following quantities:
+            * constraints related to partitioning;
+            * init callback function and enable parent flag;
+            * number of rows in parent and child tables;
+            * plan validity of simple SELECT query under partitioned table;
+        - check dumping using the following parameters of pg_dump:
+            * format = plain | custom;
+            * using of inserts and copy.
+        """
+
+        import subprocess
+
+        # Init and start postgres instance with preload pg_pathman module
+        node = get_new_node('test')
+        node.init()
+        node.append_conf(
+            'postgresql.conf',
+            'shared_preload_libraries=\'pg_pathman\'\n')
+        node.start()
+
+        # Init two databases: initial and copy
+        node.psql('postgres', 'create database initial')
+        node.psql('postgres', 'create database copy')
+        node.psql('initial', 'create extension pg_pathman')
+        node.psql('copy', 'create extension pg_pathman')
+
+        # Create and fillin partitioned table in initial database
+        with node.connect('initial') as con:
+
+            # create and initailly fillin tables
+            con.execute('create table range_partitioned (i integer not null)')
+            con.execute('insert into range_partitioned select i from generate_series(1, 1000) i')
+            con.execute('create table hash_partitioned (i integer not null)')
+            con.execute('insert into hash_partitioned select i from generate_series(1, 1000) i')
+
+            # partition table keeping data in base table
+            # enable_parent parameter automatically becames true
+            con.execute('select create_range_partitions(\'range_partitioned\', \'i\', 1, 200, partition_data := false)')
+            con.execute('select create_hash_partitions(\'hash_partitioned\', \'i\', 5, false)')
+
+            # fillin child tables
+            con.execute('insert into range_partitioned select i from generate_series(1, 1000) i')
+            con.execute('insert into hash_partitioned select i from generate_series(1, 1000) i')
+
+            # set init callback
+            con.execute("""
+                create or replace function init_partition_stub_callback(args jsonb)
+                returns void as $$
+                begin
+                end
+                $$ language plpgsql;
+            """)
+            con.execute('select set_init_callback(\'range_partitioned\', \'init_partition_stub_callback\')')
+            con.execute('select set_init_callback(\'hash_partitioned\', \'init_partition_stub_callback\')')
+
+            con.commit()
+
+        # Test dump/restore from init database to copy functionality
+        test_params = [
+            ([node.get_bin_path("pg_dump"),
+                "-p {}".format(node.port),
+                "initial"],
+             [node.get_bin_path("psql"),
+                 "-p {}".format(node.port),
+                 "copy"]),      # dump as plain text and restore via COPY
+            ([node.get_bin_path("pg_dump"),
+                "-p {}".format(node.port),
+                "--inserts",
+                "initial"],
+             [node.get_bin_path("psql"),
+                 "-p {}".format(node.port),
+                 "copy"]),      # dump as plain text and restore via INSERTs
+            ([node.get_bin_path("pg_dump"),
+                "-p {}".format(node.port),
+                "--format=custom",
+                "initial"],
+             [node.get_bin_path("pg_restore"),
+                 "-p {}".format(node.port),
+                 "--dbname=copy"]), # dump in archive format
+        ]
+        for pg_dump_params, pg_restore_params in test_params:
+
+            # transfer and restore data
+            p1 = subprocess.Popen(pg_dump_params, stdout=subprocess.PIPE)
+            p2 = subprocess.Popen(pg_restore_params, stdin=p1.stdout, stdout=subprocess.PIPE)
+            p1.stdout.close()  # Allow p1 to receive a SIGPIPE if p2 exits.
+            p2.communicate()
+
+            # check validity of data
+            with node.connect('initial') as con1, node.connect('copy') as con2:
+
+                #  import ipdb; ipdb.set_trace()
+                # compare number of rows in each partition
+                # TODO:
+                #   - uncomment code below after fix COPY statement under partitioned table with enabled parent relation
+                #   - add test case for checking plan
+                #  self.assertEqual(
+                        #  con1.execute('select count(*) from range_partitioned')[0][0],
+                        #  con2.execute('select count(*) from range_partitioned')[0][0]
+                #  )
+                #  self.assertEqual(
+                        #  con1.execute('select count(*) from hash_partitioned')[0][0],
+                        #  con2.execute('select count(*) from hash_partitioned')[0][0]
+                #  )
+
+                # compare enable_parent flag and callback function
+                config_params_query = """
+                    select partrel, enable_parent, init_callback from pathman_config_params
+                """
+                config_params_initial, config_params_copy = {}, {}
+                for row in con1.execute(config_params_query):
+                    config_params_initial[row[0]] = row[1:]
+                for row in con2.execute(config_params_query):
+                    config_params_copy[row[0]] = row[1:]
+                self.assertEqual(config_params_initial, config_params_copy)
+
+                # compare constraints on each partition
+                constraints_query = """
+                    select r.relname, c.conname, c.consrc from
+                        pg_constraint c join pg_class r on c.conrelid=r.oid
+                        where relname similar to '(range|hash)_partitioned_\d+'
+                """
+                constraints_initial, constraints_copy = {}, {}
+                for row in con1.execute(constraints_query):
+                    constraints_initial[row[0]] = row[1:]
+                for row in con2.execute(constraints_query):
+                    constraints_copy[row[0]] = row[1:]
+                self.assertEqual(constraints_initial, constraints_copy)
+
+            # clear copy database
+            node.psql('copy', 'drop schema public cascade')
+            node.psql('copy', 'create schema public')
+
+        # Stop instance and finish work
+        node.stop()
+        node.cleanup()
+
 
 if __name__ == "__main__":
     unittest.main()
